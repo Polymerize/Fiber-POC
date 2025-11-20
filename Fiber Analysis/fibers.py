@@ -31,7 +31,7 @@ if 'original_image' in st.session_state and st.session_state['original_image'] i
 
     st.subheader("Step 1: Background Masking")
     background_value = st.slider(
-        'Background Removal Sensitivity (0 = black, 255 = white)',
+        'Background Removal Sensitivity (high = more pixels will be removed)',
         0, 255, 50, # Min, Max, Default value
         key='background_slider'
     )
@@ -53,7 +53,7 @@ if 'background_removed_mask' in st.session_state and st.session_state['backgroun
     st.subheader("Step 2: Fiber Detection")
 
     min_fiber_area = st.slider(
-        'Minimum Fiber Area (pixels)',
+        'Minimum Fiber Area (pixels) to skip detecting noise from scans',
         0, 200, 5, # Min, Max, Default value
         key='min_fiber_area_slider'
     )
@@ -161,9 +161,9 @@ if 'output_image' in st.session_state and st.session_state['output_image'] is no
    'stats' in st.session_state and st.session_state['stats'] is not None and \
    'min_fiber_area' in st.session_state and st.session_state['min_fiber_area'] is not None:
 
-    st.subheader("Step 3: Optional Bounding Box Joining")
+    st.subheader("Step 3: (Optional) Bounding Box Joining")
     MAX_DISTANCE_TO_JOIN = st.slider(
-        'Max Distance to Join (pixels)',
+        'Max Distance to consider Join (pixels)',
         0, 50, 25, # Min, Max, Default value
         key='max_distance_slider'
     )
