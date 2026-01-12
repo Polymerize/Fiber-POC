@@ -149,30 +149,43 @@ def create_pdf(image, df, summary, original_filename):
     pdf.set_font("Arial", "B", 12)
     pdf.cell(0, 10, "Analysis Summary (Group Averages)", ln=True)
     pdf.set_font("Arial", "", 10)
-    for key, value in summary.items():
-        pdf.cell(0, 7, f"{key}: {value}", ln=True)
     
-    pdf.ln(10)
+    # Using formatting to ensure summary values are also consistent
+    pdf.cell(0, 7, f"Total Fibers: {summary['Total Fibers']}", ln=True)
+    pdf.cell(0, 7, f"Avg Length: {float(summary['Avg Length'].split()[0]):.3f} px", ln=True)
+    pdf.cell(0, 7, f"Avg Width: {float(summary['Avg Width'].split()[0]):.3f} px", ln=True)
+    pdf.cell(0, 7, f"Avg Tortuosity: {float(summary['Avg Tortuosity']):.3f}", ln=True)
+    
+    # --- PAGE BREAK BEFORE TABLE ---
+    pdf.add_page() 
     
     # 3. Add Table
     pdf.set_font("Arial", "B", 10)
     cols = ["ID", "Length (px)", "Width (px)", "Tortuosity", "Aspect Ratio"]
     col_widths = [15, 35, 35, 35, 35]
     
+    # Header (Now guaranteed to be at the top of a new page)
     for i, col in enumerate(cols):
         pdf.cell(col_widths[i], 10, col, border=1, align='C')
     pdf.ln()
     
+    # Rows with 3-decimal rounding
     pdf.set_font("Arial", "", 9)
     for _, row in df.iterrows():
-        # Check if we need a new page for the table
-        if pdf.get_y() > 250:
+        if pdf.get_y() > 260: # Threshold for footer safety
             pdf.add_page()
+            # Re-draw headers on the new page if the table spans multiple pages
+            pdf.set_font("Arial", "B", 10)
+            for i, col in enumerate(cols):
+                pdf.cell(col_widths[i], 10, col, border=1, align='C')
+            pdf.ln()
+            pdf.set_font("Arial", "", 9)
+
         pdf.cell(col_widths[0], 8, str(int(row['fiber_id'])), border=1, align='C')
-        pdf.cell(col_widths[1], 8, str(row['length_px']), border=1, align='C')
-        pdf.cell(col_widths[2], 8, str(row['width_px']), border=1, align='C')
-        pdf.cell(col_widths[3], 8, str(row['tortuosity']), border=1, align='C')
-        pdf.cell(col_widths[4], 8, str(row['aspect_ratio']), border=1, align='C')
+        pdf.cell(col_widths[1], 8, f"{row['length_px']:.3f}", border=1, align='C')
+        pdf.cell(col_widths[2], 8, f"{row['width_px']:.3f}", border=1, align='C')
+        pdf.cell(col_widths[3], 8, f"{row['tortuosity']:.3f}", border=1, align='C')
+        pdf.cell(col_widths[4], 8, f"{row['aspect_ratio']:.3f}", border=1, align='C')
         pdf.ln()
         
     return pdf.output()
