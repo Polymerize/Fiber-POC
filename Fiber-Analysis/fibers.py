@@ -13,6 +13,9 @@ import time
 from fpdf import FPDF
 import tempfile
 from datetime import datetime
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # Load the .env
 load_dotenv()
@@ -48,9 +51,24 @@ st.set_page_config(layout="wide", page_title="Fiber Analysis Pro")
 
 
 # --- CORE IMAGE PROCESSING ENGINE ---
-def process_fiber_image(image_bytes):
+def process_fiber_image(image_bytes, params):
+    """
+    Process fiber image with configurable parameters.
+
+    params dict should contain:
+        - fiber_core_threshold: threshold for Frangi output (default 20)
+        - min_object_area: minimum area for noise filtering (default 10)
+        - blob_threshold: threshold for blob identification (default 21)
+        - dist_transform_max: max distance transform value (default 10)
+    """
     file_bytes = np.asarray(bytearray(image_bytes), dtype=np.uint8)
     img_original = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
+
+    # Extract parameters with defaults
+    fiber_core_threshold = params.get('fiber_core_threshold', 20)
+    min_object_area = params.get('min_object_area', 10)
+    blob_threshold = params.get('blob_threshold', 21)
+    dist_transform_max = params.get('dist_transform_max', 10)
 
     # 1. Enhancement
     clahe = cv2.createCLAHE(clipLimit=0.05, tileGridSize=(3, 3))
@@ -70,23 +88,28 @@ def process_fiber_image(image_bytes):
     ).astype(np.uint8)
 
     # 3. Skeletonization & Distance Transform
-    fiber_core = (fr_norm > 20).astype(np.uint8) * 255
+    fiber_core = (fr_norm > fiber_core_threshold).astype(np.uint8) * 255
     # We store the distance transform to calculate WIDTH later
     dist_transform = cv2.distanceTransform(fiber_core, cv2.DIST_L2, 3)
 
     skeleton = skeletonize(fiber_core > 0)
-    skeleton_clean = (skeleton & (dist_transform <= 10)).astype(np.uint8) * 255
+    skeleton_clean = (skeleton & (dist_transform <= dist_transform_max)).astype(np.uint8) * 255
 
-    # 4. Filter small objects
+    # Store skeleton before noise filtering for visualization
+    skeleton_before_filter = skeleton_clean.copy()
+
+    # 4. Filter small objects (noise filtering)
     labels = label(skeleton_clean)
     skeleton_connected = np.zeros_like(skeleton_clean, dtype=bool)
     for r in regionprops(labels):
-        if r.area >= 10:
+        if r.area >= min_object_area:
             skeleton_connected[labels == r.label] = 1
     skeleton_connected = skeleton_connected.astype(np.uint8) * 255
 
+    # Store skeleton after noise filtering for visualization
+    skeleton_after_filter = skeleton_connected.copy()
+
     # 5. Blob identification
-    blob_threshold = 21
     _, blob_core = cv2.threshold(img_original, blob_threshold, 255, cv2.THRESH_BINARY)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (6, 6))
     opened = cv2.morphologyEx(blob_core, cv2.MORPH_OPEN, kernel)
@@ -97,12 +120,15 @@ def process_fiber_image(image_bytes):
     final_image = cv2.bitwise_and(skeleton_connected, inv_opened)
     skeleton_final = (skeletonize(final_image > 0).astype(np.uint8)) * 255
 
-    # 7. Path Extraction (Your original logic)
+    # 7. Path Extraction & Junction Detection
     skel_kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
     neighbor_count = cv2.filter2D(
         (skeleton_final > 0).astype(np.uint8), -1, skel_kernel
     )
     endpoints = np.logical_and(skeleton_final > 0, neighbor_count == 1)
+
+    # Junction points are where a skeleton pixel has more than 2 neighbors
+    junction_points = np.logical_and(skeleton_final > 0, neighbor_count >= 3)
 
     h, w = skeleton_final.shape
     visited = np.zeros_like(skeleton_final, dtype=bool)
@@ -141,7 +167,16 @@ def process_fiber_image(image_bytes):
         if len(path) > 2:
             fibers.append(path)
 
-    return skeleton_final, fibers, img_original, dist_transform
+    # Return additional data for visualizations
+    intermediate_images = {
+        'skeleton_before_filter': skeleton_before_filter,
+        'skeleton_after_filter': skeleton_after_filter,
+        'frangi_output': fr_norm,
+        'junction_points': junction_points,
+        'endpoints': endpoints,
+    }
+
+    return skeleton_final, fibers, img_original, dist_transform, intermediate_images
 
 
 # --- PDF GENERATION LOGIC ---
@@ -267,17 +302,89 @@ def analyze_fiber_stats(path, dist_map):
 
 # --- APP LAYOUT ---
 st.title("🔬 Advanced Fiber Analysis")
-st.sidebar.header("Analysis Settings")
-min_length = st.sidebar.slider("Min Fiber Length (px)", 5, 200, 30)
+
+# Sidebar with all configurable parameters
+st.sidebar.header("🎛️ Analysis Settings")
+
+st.sidebar.subheader("Fiber Length Filters")
+min_length = st.sidebar.slider(
+    "Min Fiber Length (px)",
+    min_value=5, max_value=200, value=30,
+    help="Minimum length to consider a fiber valid"
+)
+max_length = st.sidebar.slider(
+    "Max Fiber Length (px)",
+    min_value=50, max_value=2000, value=1000,
+    help="Maximum length to consider a fiber valid (filters out artifacts)"
+)
+
+st.sidebar.subheader("Noise Filtering")
+min_object_area = st.sidebar.slider(
+    "Min Object Area (px)",
+    min_value=1, max_value=100, value=10,
+    help="Objects smaller than this area are filtered as noise"
+)
+fiber_core_threshold = st.sidebar.slider(
+    "Fiber Detection Sensitivity",
+    min_value=5, max_value=100, value=20,
+    help="Lower = more sensitive (detects fainter fibers), Higher = stricter"
+)
+
+st.sidebar.subheader("Advanced Parameters")
+blob_threshold = st.sidebar.slider(
+    "Blob Threshold",
+    min_value=5, max_value=100, value=21,
+    help="Threshold for identifying and removing blob artifacts"
+)
+dist_transform_max = st.sidebar.slider(
+    "Max Fiber Width Detection",
+    min_value=5, max_value=50, value=10,
+    help="Maximum distance transform value for skeleton cleaning"
+)
+
+# Visualization options
+st.sidebar.subheader("📊 Display Options")
+show_noise_filter_view = st.sidebar.checkbox("Show Noise Filtering Impact", value=False)
+show_junction_overlay = st.sidebar.checkbox("Show Junction Points", value=True)
+show_frangi_output = st.sidebar.checkbox("Show Frangi Filter Output", value=False)
 
 uploaded_file = st.file_uploader("Upload fiber image", type=["jpg", "jpeg", "png"])
 
 if uploaded_file is not None:
     with st.spinner("Analyzing fibers..."):
         start_time = time.time()
-        skeleton_final, fibers, img_original, dist_transform = process_fiber_image(
-            uploaded_file.read()
+
+        # Prepare processing parameters
+        processing_params = {
+            'fiber_core_threshold': fiber_core_threshold,
+            'min_object_area': min_object_area,
+            'blob_threshold': blob_threshold,
+            'dist_transform_max': dist_transform_max,
+        }
+
+        skeleton_final, fibers, img_original, dist_transform, intermediate_images = process_fiber_image(
+            uploaded_file.read(), processing_params
         )
+
+        # --- OPTIONAL: Frangi Filter Output View ---
+        if show_frangi_output:
+            st.subheader("🔍 Frangi Filter Output")
+            frangi_colored = cv2.applyColorMap(intermediate_images['frangi_output'], cv2.COLORMAP_JET)
+            st.image(frangi_colored, use_container_width=True, caption="Frangi filter response (fiber enhancement)")
+
+        # --- OPTIONAL: Noise Filtering Impact View ---
+        if show_noise_filter_view:
+            st.subheader("🧹 Noise Filtering Impact")
+            col_before, col_after = st.columns(2)
+            with col_before:
+                st.image(intermediate_images['skeleton_before_filter'],
+                         use_container_width=True,
+                         caption="Before Noise Filtering")
+            with col_after:
+                st.image(intermediate_images['skeleton_after_filter'],
+                         use_container_width=True,
+                         caption="After Noise Filtering")
+
         # Prepare Visualizations
         img_bgr = cv2.cvtColor(img_original, cv2.COLOR_GRAY2BGR)
         highlight_vis = img_bgr.copy()
@@ -288,17 +395,9 @@ if uploaded_file is not None:
                 for p1, p2 in zip(path[:-1], path[1:])
             )
 
-            if length_px < min_length:
+            # Apply both min and max length filters
+            if length_px < min_length or length_px > max_length:
                 continue
-
-            # Bounding Box Logic (not used here)
-            # color = (0, 255, 0) # Green
-
-            # ys, xs = [p[0] for p in path], [p[1] for p in path]
-            # x1, y1, x2, y2 = min(xs)-3, min(ys)-3, max(xs)+3, max(ys)+3
-            # cv2.rectangle(bbox_vis, (x1, y1), (x2, y2), color, 1)
-            # cv2.putText(bbox_vis, f"{length_px:.1f}", (x1, max(y1-5, 10)),
-            #             cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
 
             # Highlight Logic (drawing the actual fiber)
             for y, x in path:
@@ -306,16 +405,23 @@ if uploaded_file is not None:
                     highlight_vis, (x, y), 1, (255, 0, 255), -1
                 )  # Magenta highlights
 
-        # changed since bounding box view is separately used after this step
-        # col1, col2 = st.columns(2)
-        # with col1:
-        #     st.subheader("Bounding Box View")
-        #     st.image(bbox_vis, use_container_width=True)
+        # --- JUNCTION POINTS OVERLAY ---
+        if show_junction_overlay:
+            junction_points = intermediate_images['junction_points']
+            endpoints = intermediate_images['endpoints']
 
-        # with col2:
+            # Draw junction points in cyan (larger circles)
+            for y, x in zip(*np.where(junction_points)):
+                cv2.circle(highlight_vis, (x, y), 3, (255, 255, 0), -1)  # Cyan for junctions
+
+            # Draw endpoints in yellow (smaller circles)
+            for y, x in zip(*np.where(endpoints)):
+                cv2.circle(highlight_vis, (x, y), 2, (0, 255, 255), -1)  # Yellow for endpoints
 
         # Display Results
-        st.subheader("Highlighted Fiber View")
+        st.subheader("Highlighted Fiber View" + (" with Junction Points" if show_junction_overlay else ""))
+        if show_junction_overlay:
+            st.caption("🟡 Yellow = Endpoints | 🔵 Cyan = Junction Points | 🟣 Magenta = Fiber Paths")
         st.image(highlight_vis, use_container_width=True)
 
         # Data storage
@@ -324,11 +430,14 @@ if uploaded_file is not None:
         analysis_vis = img_bgr.copy()
 
         # Process each detected fiber
+        fiber_id_counter = 1
         for i, path in enumerate(fibers):
             stats = analyze_fiber_stats(path, dist_transform)
-            if stats["length_px"] < min_length:
+            # Apply both min and max length filters
+            if stats["length_px"] < min_length or stats["length_px"] > max_length:
                 continue
-            stats["fiber_id"] = i + 1
+            stats["fiber_id"] = fiber_id_counter
+            fiber_id_counter += 1
             fiber_data.append(stats)
             ys, xs = [p[0] for p in path], [p[1] for p in path]
             cv2.rectangle(
@@ -340,7 +449,7 @@ if uploaded_file is not None:
             )
             cv2.putText(
                 analysis_vis,
-                str(i + 1),
+                str(stats["fiber_id"]),
                 (min(xs), min(ys) - 5),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.4,
@@ -349,6 +458,31 @@ if uploaded_file is not None:
             )
 
         df = pd.DataFrame(fiber_data)
+
+        # --- SUMMARY METRICS DISPLAY ON WEBSITE ---
+        if not df.empty:
+            st.subheader("📊 Analysis Summary")
+            metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+            with metric_col1:
+                st.metric("Total Fibers", len(df))
+            with metric_col2:
+                st.metric("Avg Length", f"{df['length_px'].mean():.2f} px")
+            with metric_col3:
+                st.metric("Avg Width", f"{df['width_px'].mean():.2f} px")
+            with metric_col4:
+                st.metric("Avg Curvature Rate", f"{df['curvature_rate'].mean():.3f}")
+
+            # Additional stats row
+            stat_col1, stat_col2, stat_col3, stat_col4 = st.columns(4)
+            with stat_col1:
+                st.metric("Min Length", f"{df['length_px'].min():.2f} px")
+            with stat_col2:
+                st.metric("Max Length", f"{df['length_px'].max():.2f} px")
+            with stat_col3:
+                st.metric("Avg Aspect Ratio", f"{df['aspect_ratio'].mean():.2f}")
+            with stat_col4:
+                junction_count = np.sum(intermediate_images['junction_points'])
+                st.metric("Junction Points", junction_count)
 
         col1, col2 = st.columns([2, 1])
         with col1:
@@ -381,6 +515,114 @@ if uploaded_file is not None:
 
             else:
                 st.warning("No fibers detected.")
+
+        # --- METRIC VISUALIZATIONS ---
+        if not df.empty:
+            st.subheader("📈 Metric Visualizations")
+
+            # Create tabs for different visualization types
+            viz_tab1, viz_tab2, viz_tab3 = st.tabs(["Length & Width", "Curvature Analysis", "Distribution Overview"])
+
+            with viz_tab1:
+                viz_col1, viz_col2 = st.columns(2)
+
+                with viz_col1:
+                    # Histogram for fiber lengths
+                    fig_length = px.histogram(
+                        df, x='length_px',
+                        nbins=20,
+                        title='Fiber Length Distribution',
+                        labels={'length_px': 'Length (px)', 'count': 'Count'},
+                        color_discrete_sequence=['#FF6B6B']
+                    )
+                    fig_length.update_layout(
+                        showlegend=False,
+                        xaxis_title="Length (px)",
+                        yaxis_title="Count"
+                    )
+                    st.plotly_chart(fig_length, use_container_width=True)
+
+                with viz_col2:
+                    # Histogram for fiber widths
+                    fig_width = px.histogram(
+                        df, x='width_px',
+                        nbins=20,
+                        title='Fiber Width Distribution',
+                        labels={'width_px': 'Width (px)', 'count': 'Count'},
+                        color_discrete_sequence=['#4ECDC4']
+                    )
+                    fig_width.update_layout(
+                        showlegend=False,
+                        xaxis_title="Width (px)",
+                        yaxis_title="Count"
+                    )
+                    st.plotly_chart(fig_width, use_container_width=True)
+
+            with viz_tab2:
+                viz_col3, viz_col4 = st.columns(2)
+
+                with viz_col3:
+                    # Curvature rate distribution (box plot)
+                    fig_curv = px.box(
+                        df, y='curvature_rate',
+                        title='Curvature Rate Distribution',
+                        labels={'curvature_rate': 'Curvature Rate'},
+                        color_discrete_sequence=['#45B7D1']
+                    )
+                    fig_curv.update_layout(showlegend=False)
+                    st.plotly_chart(fig_curv, use_container_width=True)
+
+                with viz_col4:
+                    # Scatter plot: Length vs Curvature Rate
+                    fig_scatter = px.scatter(
+                        df, x='length_px', y='curvature_rate',
+                        title='Length vs Curvature Rate',
+                        labels={'length_px': 'Length (px)', 'curvature_rate': 'Curvature Rate'},
+                        color='width_px',
+                        color_continuous_scale='Viridis',
+                        hover_data=['fiber_id', 'aspect_ratio']
+                    )
+                    fig_scatter.update_layout(coloraxis_colorbar_title="Width (px)")
+                    st.plotly_chart(fig_scatter, use_container_width=True)
+
+            with viz_tab3:
+                # Comprehensive overview with subplots
+                fig_overview = make_subplots(
+                    rows=2, cols=2,
+                    subplot_titles=('Length Distribution', 'Width Distribution',
+                                    'Aspect Ratio Distribution', 'Curvature Rate Histogram')
+                )
+
+                # Length histogram
+                fig_overview.add_trace(
+                    go.Histogram(x=df['length_px'], name='Length', marker_color='#FF6B6B', nbinsx=15),
+                    row=1, col=1
+                )
+
+                # Width histogram
+                fig_overview.add_trace(
+                    go.Histogram(x=df['width_px'], name='Width', marker_color='#4ECDC4', nbinsx=15),
+                    row=1, col=2
+                )
+
+                # Aspect ratio histogram
+                fig_overview.add_trace(
+                    go.Histogram(x=df['aspect_ratio'], name='Aspect Ratio', marker_color='#96CEB4', nbinsx=15),
+                    row=2, col=1
+                )
+
+                # Curvature rate histogram
+                fig_overview.add_trace(
+                    go.Histogram(x=df['curvature_rate'], name='Curvature Rate', marker_color='#45B7D1', nbinsx=15),
+                    row=2, col=2
+                )
+
+                fig_overview.update_layout(
+                    height=600,
+                    showlegend=False,
+                    title_text="Fiber Metrics Overview"
+                )
+                st.plotly_chart(fig_overview, use_container_width=True)
 
         if not df.empty:
             # Generate PDF
