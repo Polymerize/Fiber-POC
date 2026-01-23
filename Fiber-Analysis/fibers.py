@@ -349,7 +349,7 @@ st.sidebar.header("🎛️ Analysis Settings")
 st.sidebar.subheader("Fiber Length Filters")
 min_length = st.sidebar.slider(
     "Min Fiber Length (px)",
-    min_value=5, max_value=200, value=30,
+    min_value=5, max_value=200, value=15,
     help="Minimum length to consider a fiber valid"
 )
 max_length = st.sidebar.slider(
@@ -366,7 +366,7 @@ min_object_area = st.sidebar.slider(
 )
 fiber_core_threshold = st.sidebar.slider(
     "Fiber Detection Sensitivity",
-    min_value=5, max_value=100, value=20,
+    min_value=5, max_value=100, value=25,
     help="Lower = more sensitive (detects fainter fibers), Higher = stricter"
 )
 
