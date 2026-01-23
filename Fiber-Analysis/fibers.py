@@ -149,6 +149,45 @@ def process_fiber_image(image_bytes, params):
             if 0 <= ny < h and 0 <= nx < w and skeleton_final[ny, nx] > 0:
                 yield ny, nx
 
+    def get_angle(p1, p2):
+        """Calculate angle from p1 to p2 in radians."""
+        dy = p2[0] - p1[0]
+        dx = p2[1] - p1[1]
+        return math.atan2(dy, dx)
+
+    def angle_difference(a1, a2):
+        """Calculate smallest angle difference between two angles."""
+        diff = abs(a1 - a2)
+        return min(diff, 2 * math.pi - diff)
+
+    def select_best_neighbor(prev, curr, neighbors):
+        """
+        Select the neighbor that continues most straight from the incoming direction.
+        At junctions, this picks the path with smallest angle change.
+        """
+        if prev is None or len(neighbors) == 1:
+            return neighbors[0]
+
+        # Calculate incoming direction (from prev to curr)
+        incoming_angle = get_angle(prev, curr)
+        # The "straight" continuation would be the same angle
+        continuation_angle = incoming_angle
+
+        best_neighbor = None
+        min_angle_diff = float('inf')
+
+        for nbr in neighbors:
+            # Calculate outgoing angle (from curr to neighbor)
+            outgoing_angle = get_angle(curr, nbr)
+            # How much does this deviate from going straight?
+            diff = angle_difference(continuation_angle, outgoing_angle)
+
+            if diff < min_angle_diff:
+                min_angle_diff = diff
+                best_neighbor = nbr
+
+        return best_neighbor
+
     for sy, sx in zip(*np.where(endpoints)):
         if visited[sy, sx]:
             continue
@@ -160,7 +199,8 @@ def process_fiber_image(image_bytes, params):
             nbrs = [n for n in get_neighbors(y, x) if n != prev and not visited[n]]
             if not nbrs:
                 break
-            nxt = nbrs[0]
+            # Use angle-based selection at junctions instead of arbitrary choice
+            nxt = select_best_neighbor(prev, curr, nbrs)
             path.append(nxt)
             visited[nxt] = True
             prev, curr = curr, nxt
