@@ -51,20 +51,11 @@ st.set_page_config(layout="wide", page_title="Fiber Analysis Pro")
 
 
 # --- CORE IMAGE PROCESSING ENGINE ---
-def process_fiber_image(image_bytes, params):
-    """
-    Process fiber image with configurable parameters.
 
-    params dict should contain:
-        - fiber_core_threshold: threshold for Frangi output (default 20)
-        - min_object_area: minimum area for noise filtering (default 10)
-        - blob_threshold: threshold for blob identification (default 21)
-        - dist_transform_max: max distance transform value (default 10)
+def get_skeleton_and_junctions(img_original, params):
     """
-    file_bytes = np.asarray(bytearray(image_bytes), dtype=np.uint8)
-    img_original = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
-
-    # Extract parameters with defaults
+    Common preprocessing: returns skeleton, junctions, endpoints, and other shared data.
+    """
     fiber_core_threshold = params.get('fiber_core_threshold', 20)
     min_object_area = params.get('min_object_area', 10)
     blob_threshold = params.get('blob_threshold', 21)
@@ -74,7 +65,7 @@ def process_fiber_image(image_bytes, params):
     clahe = cv2.createCLAHE(clipLimit=0.05, tileGridSize=(3, 3))
     enhanced = clahe.apply(img_original.astype(np.uint8))
 
-    # 2. Frangi Filter (Used for detection as requested)
+    # 2. Frangi Filter
     fr = frangi(
         enhanced,
         sigmas=np.arange(0.5, 4, 0.5),
@@ -89,16 +80,14 @@ def process_fiber_image(image_bytes, params):
 
     # 3. Skeletonization & Distance Transform
     fiber_core = (fr_norm > fiber_core_threshold).astype(np.uint8) * 255
-    # We store the distance transform to calculate WIDTH later
     dist_transform = cv2.distanceTransform(fiber_core, cv2.DIST_L2, 3)
 
     skeleton = skeletonize(fiber_core > 0)
     skeleton_clean = (skeleton & (dist_transform <= dist_transform_max)).astype(np.uint8) * 255
 
-    # Store skeleton before noise filtering for visualization
     skeleton_before_filter = skeleton_clean.copy()
 
-    # 4. Filter small objects (noise filtering)
+    # 4. Filter small objects
     labels = label(skeleton_clean)
     skeleton_connected = np.zeros_like(skeleton_clean, dtype=bool)
     for r in regionprops(labels):
@@ -106,7 +95,6 @@ def process_fiber_image(image_bytes, params):
             skeleton_connected[labels == r.label] = 1
     skeleton_connected = skeleton_connected.astype(np.uint8) * 255
 
-    # Store skeleton after noise filtering for visualization
     skeleton_after_filter = skeleton_connected.copy()
 
     # 5. Blob identification
@@ -120,70 +108,170 @@ def process_fiber_image(image_bytes, params):
     final_image = cv2.bitwise_and(skeleton_connected, inv_opened)
     skeleton_final = (skeletonize(final_image > 0).astype(np.uint8)) * 255
 
-    # 7. Path Extraction & Junction Detection
+    # 7. Junction Detection
     skel_kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
     neighbor_count = cv2.filter2D(
         (skeleton_final > 0).astype(np.uint8), -1, skel_kernel
     )
     endpoints = np.logical_and(skeleton_final > 0, neighbor_count == 1)
-
-    # Junction points are where a skeleton pixel has more than 2 neighbors
     junction_points = np.logical_and(skeleton_final > 0, neighbor_count >= 3)
 
+    return {
+        'skeleton_final': skeleton_final,
+        'dist_transform': dist_transform,
+        'endpoints': endpoints,
+        'junction_points': junction_points,
+        'neighbor_count': neighbor_count,
+        'skeleton_before_filter': skeleton_before_filter,
+        'skeleton_after_filter': skeleton_after_filter,
+        'frangi_output': fr_norm,
+    }
+
+
+def get_path_intensity(path, img, window=5):
+    """Get average intensity of last 'window' pixels in path."""
+    if len(path) < window:
+        points = path
+    else:
+        points = path[-window:]
+    intensities = [img[y, x] for y, x in points]
+    return np.mean(intensities)
+
+
+def get_neighbor_intensity(curr, neighbor, img, skeleton_final, lookahead=3):
+    """Look ahead from neighbor and get average intensity."""
+    h, w = skeleton_final.shape
+    intensities = [img[neighbor[0], neighbor[1]]]
+
+    def get_neighbors(y, x):
+        for dy, dx in [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]:
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < h and 0 <= nx < w and skeleton_final[ny, nx] > 0:
+                yield ny, nx
+
+    prev, current = curr, neighbor
+    for _ in range(lookahead - 1):
+        nbrs = [n for n in get_neighbors(current[0], current[1]) if n != prev]
+        if not nbrs:
+            break
+        nxt = nbrs[0]  # Just follow any path for lookahead
+        intensities.append(img[nxt[0], nxt[1]])
+        prev, current = current, nxt
+
+    return np.mean(intensities)
+
+
+# === METHOD 1: ANGLE-ONLY (Original) ===
+def extract_fibers_angle_only(skeleton_data, img_original):
+    """Original method: angle-based path continuation only."""
+    skeleton_final = skeleton_data['skeleton_final']
+    endpoints = skeleton_data['endpoints']
     h, w = skeleton_final.shape
     visited = np.zeros_like(skeleton_final, dtype=bool)
     fibers = []
 
     def get_neighbors(y, x):
-        for dy, dx in [
-            (-1, -1),
-            (-1, 0),
-            (-1, 1),
-            (0, -1),
-            (0, 1),
-            (1, -1),
-            (1, 0),
-            (1, 1),
-        ]:
+        for dy, dx in [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]:
             ny, nx = y + dy, x + dx
             if 0 <= ny < h and 0 <= nx < w and skeleton_final[ny, nx] > 0:
                 yield ny, nx
 
     def get_angle(p1, p2):
-        """Calculate angle from p1 to p2 in radians."""
         dy = p2[0] - p1[0]
         dx = p2[1] - p1[1]
         return math.atan2(dy, dx)
 
     def angle_difference(a1, a2):
-        """Calculate smallest angle difference between two angles."""
         diff = abs(a1 - a2)
         return min(diff, 2 * math.pi - diff)
 
     def select_best_neighbor(prev, curr, neighbors):
-        """
-        Select the neighbor that continues most straight from the incoming direction.
-        At junctions, this picks the path with smallest angle change.
-        """
+        if prev is None or len(neighbors) == 1:
+            return neighbors[0]
+        incoming_angle = get_angle(prev, curr)
+        best_neighbor = None
+        min_angle_diff = float('inf')
+        for nbr in neighbors:
+            outgoing_angle = get_angle(curr, nbr)
+            diff = angle_difference(incoming_angle, outgoing_angle)
+            if diff < min_angle_diff:
+                min_angle_diff = diff
+                best_neighbor = nbr
+        return best_neighbor
+
+    for sy, sx in zip(*np.where(endpoints)):
+        if visited[sy, sx]:
+            continue
+        path = [(sy, sx)]
+        visited[sy, sx] = True
+        curr, prev = (sy, sx), None
+        while True:
+            y, x = curr
+            nbrs = [n for n in get_neighbors(y, x) if n != prev and not visited[n]]
+            if not nbrs:
+                break
+            nxt = select_best_neighbor(prev, curr, nbrs)
+            path.append(nxt)
+            visited[nxt] = True
+            prev, curr = curr, nxt
+        if len(path) > 2:
+            fibers.append(path)
+
+    return fibers
+
+
+# === METHOD 2: INTENSITY-WEIGHTED JUNCTION DECISIONS ===
+def extract_fibers_intensity_weighted(skeleton_data, img_original, intensity_weight=0.5):
+    """
+    At junctions, combine angle score with intensity similarity.
+    Favors paths where intensity matches the incoming fiber's intensity profile.
+    """
+    skeleton_final = skeleton_data['skeleton_final']
+    endpoints = skeleton_data['endpoints']
+    h, w = skeleton_final.shape
+    visited = np.zeros_like(skeleton_final, dtype=bool)
+    fibers = []
+
+    def get_neighbors(y, x):
+        for dy, dx in [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]:
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < h and 0 <= nx < w and skeleton_final[ny, nx] > 0:
+                yield ny, nx
+
+    def get_angle(p1, p2):
+        dy = p2[0] - p1[0]
+        dx = p2[1] - p1[1]
+        return math.atan2(dy, dx)
+
+    def angle_difference(a1, a2):
+        diff = abs(a1 - a2)
+        return min(diff, 2 * math.pi - diff)
+
+    def select_best_neighbor_weighted(prev, curr, neighbors, path):
         if prev is None or len(neighbors) == 1:
             return neighbors[0]
 
-        # Calculate incoming direction (from prev to curr)
         incoming_angle = get_angle(prev, curr)
-        # The "straight" continuation would be the same angle
-        continuation_angle = incoming_angle
+        path_intensity = get_path_intensity(path, img_original, window=5)
 
         best_neighbor = None
-        min_angle_diff = float('inf')
+        best_score = float('inf')
 
         for nbr in neighbors:
-            # Calculate outgoing angle (from curr to neighbor)
+            # Angle score (0 = straight, pi = U-turn)
             outgoing_angle = get_angle(curr, nbr)
-            # How much does this deviate from going straight?
-            diff = angle_difference(continuation_angle, outgoing_angle)
+            angle_diff = angle_difference(incoming_angle, outgoing_angle)
+            angle_score = angle_diff / math.pi  # Normalize to 0-1
 
-            if diff < min_angle_diff:
-                min_angle_diff = diff
+            # Intensity score (difference from path intensity)
+            nbr_intensity = get_neighbor_intensity(curr, nbr, img_original, skeleton_final, lookahead=3)
+            intensity_diff = abs(path_intensity - nbr_intensity) / 255.0  # Normalize to 0-1
+
+            # Combined score (lower is better)
+            combined_score = (1 - intensity_weight) * angle_score + intensity_weight * intensity_diff
+
+            if combined_score < best_score:
+                best_score = combined_score
                 best_neighbor = nbr
 
         return best_neighbor
@@ -199,24 +287,278 @@ def process_fiber_image(image_bytes, params):
             nbrs = [n for n in get_neighbors(y, x) if n != prev and not visited[n]]
             if not nbrs:
                 break
-            # Use angle-based selection at junctions instead of arbitrary choice
-            nxt = select_best_neighbor(prev, curr, nbrs)
+            nxt = select_best_neighbor_weighted(prev, curr, nbrs, path)
             path.append(nxt)
             visited[nxt] = True
             prev, curr = curr, nxt
         if len(path) > 2:
             fibers.append(path)
 
+    return fibers
+
+
+# === METHOD 3: POST-PROCESSING FIBER MERGING ===
+def extract_fibers_with_merging(skeleton_data, img_original, intensity_threshold=25, angle_threshold=45):
+    """
+    Extract fibers with angle-only, then merge segments at junctions
+    if they have similar intensities and compatible directions.
+    """
+    skeleton_final = skeleton_data['skeleton_final']
+    junction_points = skeleton_data['junction_points']
+
+    # First, get fibers using angle-only method
+    fibers = extract_fibers_angle_only(skeleton_data, img_original)
+
+    if len(fibers) < 2:
+        return fibers
+
+    # Calculate intensity profile for each fiber
+    fiber_intensities = []
+    for path in fibers:
+        intensities = [img_original[y, x] for y, x in path]
+        fiber_intensities.append({
+            'mean': np.mean(intensities),
+            'std': np.std(intensities),
+            'start': path[0],
+            'end': path[-1],
+            'start_angle': math.atan2(path[1][0] - path[0][0], path[1][1] - path[0][1]) if len(path) > 1 else 0,
+            'end_angle': math.atan2(path[-1][0] - path[-2][0], path[-1][1] - path[-2][1]) if len(path) > 1 else 0,
+        })
+
+    # Find junction locations
+    junction_coords = set(zip(*np.where(junction_points)))
+
+    def is_near_junction(point, radius=3):
+        y, x = point
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                if (y + dy, x + dx) in junction_coords:
+                    return True
+        return False
+
+    def points_close(p1, p2, threshold=5):
+        return math.hypot(p1[0] - p2[0], p1[1] - p2[1]) <= threshold
+
+    def angles_compatible(a1, a2, threshold_deg):
+        # Check if angles are roughly opposite (continuation)
+        diff = abs(a1 - a2)
+        diff = min(diff, 2 * math.pi - diff)
+        # For continuation, angles should be ~180 degrees apart
+        continuation_diff = abs(diff - math.pi)
+        return continuation_diff < math.radians(threshold_deg)
+
+    # Try to merge fibers
+    merged = [False] * len(fibers)
+    merged_fibers = []
+
+    for i in range(len(fibers)):
+        if merged[i]:
+            continue
+
+        current_fiber = list(fibers[i])
+        current_info = fiber_intensities[i]
+        changed = True
+
+        while changed:
+            changed = False
+            for j in range(len(fibers)):
+                if i == j or merged[j]:
+                    continue
+
+                other_info = fiber_intensities[j]
+                intensity_diff = abs(current_info['mean'] - other_info['mean'])
+
+                if intensity_diff > intensity_threshold:
+                    continue
+
+                # Check if endpoints meet at a junction
+                # Current end -> Other start
+                if (is_near_junction(current_fiber[-1]) and
+                    points_close(current_fiber[-1], fibers[j][0]) and
+                    angles_compatible(current_info['end_angle'], other_info['start_angle'], angle_threshold)):
+                    current_fiber.extend(fibers[j][1:])
+                    current_info['end'] = other_info['end']
+                    current_info['end_angle'] = other_info['end_angle']
+                    current_info['mean'] = np.mean([img_original[y, x] for y, x in current_fiber])
+                    merged[j] = True
+                    changed = True
+                    break
+
+                # Current end -> Other end (reverse other)
+                if (is_near_junction(current_fiber[-1]) and
+                    points_close(current_fiber[-1], fibers[j][-1]) and
+                    angles_compatible(current_info['end_angle'], -other_info['end_angle'], angle_threshold)):
+                    current_fiber.extend(reversed(fibers[j][:-1]))
+                    current_info['end'] = other_info['start']
+                    current_info['end_angle'] = -other_info['start_angle']
+                    current_info['mean'] = np.mean([img_original[y, x] for y, x in current_fiber])
+                    merged[j] = True
+                    changed = True
+                    break
+
+                # Current start -> Other end
+                if (is_near_junction(current_fiber[0]) and
+                    points_close(current_fiber[0], fibers[j][-1]) and
+                    angles_compatible(-current_info['start_angle'], other_info['end_angle'], angle_threshold)):
+                    current_fiber = list(fibers[j]) + current_fiber[1:]
+                    current_info['start'] = other_info['start']
+                    current_info['start_angle'] = other_info['start_angle']
+                    current_info['mean'] = np.mean([img_original[y, x] for y, x in current_fiber])
+                    merged[j] = True
+                    changed = True
+                    break
+
+                # Current start -> Other start (reverse other)
+                if (is_near_junction(current_fiber[0]) and
+                    points_close(current_fiber[0], fibers[j][0]) and
+                    angles_compatible(-current_info['start_angle'], -other_info['start_angle'], angle_threshold)):
+                    current_fiber = list(reversed(fibers[j])) + current_fiber[1:]
+                    current_info['start'] = other_info['end']
+                    current_info['start_angle'] = -other_info['end_angle']
+                    current_info['mean'] = np.mean([img_original[y, x] for y, x in current_fiber])
+                    merged[j] = True
+                    changed = True
+                    break
+
+        merged_fibers.append(current_fiber)
+        merged[i] = True
+
+    return merged_fibers
+
+
+# === METHOD 4: INTENSITY CORRIDOR TRACKING ===
+def extract_fibers_intensity_corridor(skeleton_data, img_original, max_intensity_deviation=30):
+    """
+    Track along an intensity corridor - penalize paths that deviate
+    too much from the running average intensity.
+    """
+    skeleton_final = skeleton_data['skeleton_final']
+    endpoints = skeleton_data['endpoints']
+    h, w = skeleton_final.shape
+    visited = np.zeros_like(skeleton_final, dtype=bool)
+    fibers = []
+
+    def get_neighbors(y, x):
+        for dy, dx in [(-1,-1),(-1,0),(-1,1),(0,-1),(0,1),(1,-1),(1,0),(1,1)]:
+            ny, nx = y + dy, x + dx
+            if 0 <= ny < h and 0 <= nx < w and skeleton_final[ny, nx] > 0:
+                yield ny, nx
+
+    def get_angle(p1, p2):
+        dy = p2[0] - p1[0]
+        dx = p2[1] - p1[1]
+        return math.atan2(dy, dx)
+
+    def angle_difference(a1, a2):
+        diff = abs(a1 - a2)
+        return min(diff, 2 * math.pi - diff)
+
+    for sy, sx in zip(*np.where(endpoints)):
+        if visited[sy, sx]:
+            continue
+        path = [(sy, sx)]
+        visited[sy, sx] = True
+        curr, prev = (sy, sx), None
+
+        # Running intensity estimate (exponential moving average)
+        running_intensity = float(img_original[sy, sx])
+        alpha = 0.3  # Smoothing factor
+
+        while True:
+            y, x = curr
+            nbrs = [n for n in get_neighbors(y, x) if n != prev and not visited[n]]
+            if not nbrs:
+                break
+
+            if prev is None or len(nbrs) == 1:
+                nxt = nbrs[0]
+            else:
+                # Score each neighbor
+                incoming_angle = get_angle(prev, curr)
+                best_neighbor = None
+                best_score = float('inf')
+
+                for nbr in nbrs:
+                    # Angle component
+                    outgoing_angle = get_angle(curr, nbr)
+                    angle_diff = angle_difference(incoming_angle, outgoing_angle)
+
+                    # Intensity component - how much does this pixel deviate?
+                    nbr_intensity = float(img_original[nbr[0], nbr[1]])
+                    intensity_deviation = abs(nbr_intensity - running_intensity)
+
+                    # If deviation is too large, heavily penalize
+                    if intensity_deviation > max_intensity_deviation:
+                        intensity_penalty = 2.0 + (intensity_deviation - max_intensity_deviation) / 50.0
+                    else:
+                        intensity_penalty = intensity_deviation / max_intensity_deviation
+
+                    # Combined score
+                    score = angle_diff + intensity_penalty * 0.5
+
+                    if score < best_score:
+                        best_score = score
+                        best_neighbor = nbr
+
+                nxt = best_neighbor
+
+            # Update running intensity
+            nxt_intensity = float(img_original[nxt[0], nxt[1]])
+            running_intensity = alpha * nxt_intensity + (1 - alpha) * running_intensity
+
+            path.append(nxt)
+            visited[nxt] = True
+            prev, curr = curr, nxt
+
+        if len(path) > 2:
+            fibers.append(path)
+
+    return fibers
+
+
+def process_fiber_image(image_bytes, params, method='angle_only'):
+    """
+    Process fiber image with configurable parameters and method.
+
+    Methods:
+        - 'angle_only': Original angle-based method
+        - 'intensity_weighted': Intensity-weighted junction decisions
+        - 'post_merge': Post-processing fiber merging
+        - 'intensity_corridor': Intensity corridor tracking
+    """
+    file_bytes = np.asarray(bytearray(image_bytes), dtype=np.uint8)
+    img_original = cv2.imdecode(file_bytes, cv2.IMREAD_GRAYSCALE)
+
+    # Get skeleton and junction data
+    skeleton_data = get_skeleton_and_junctions(img_original, params)
+
+    # Extract fibers using selected method
+    intensity_weight = params.get('intensity_weight', 0.5)
+    intensity_threshold = params.get('intensity_threshold', 25)
+    angle_threshold = params.get('merge_angle_threshold', 45)
+    max_intensity_deviation = params.get('max_intensity_deviation', 30)
+
+    if method == 'angle_only':
+        fibers = extract_fibers_angle_only(skeleton_data, img_original)
+    elif method == 'intensity_weighted':
+        fibers = extract_fibers_intensity_weighted(skeleton_data, img_original, intensity_weight)
+    elif method == 'post_merge':
+        fibers = extract_fibers_with_merging(skeleton_data, img_original, intensity_threshold, angle_threshold)
+    elif method == 'intensity_corridor':
+        fibers = extract_fibers_intensity_corridor(skeleton_data, img_original, max_intensity_deviation)
+    else:
+        fibers = extract_fibers_angle_only(skeleton_data, img_original)
+
     # Return additional data for visualizations
     intermediate_images = {
-        'skeleton_before_filter': skeleton_before_filter,
-        'skeleton_after_filter': skeleton_after_filter,
-        'frangi_output': fr_norm,
-        'junction_points': junction_points,
-        'endpoints': endpoints,
+        'skeleton_before_filter': skeleton_data['skeleton_before_filter'],
+        'skeleton_after_filter': skeleton_data['skeleton_after_filter'],
+        'frangi_output': skeleton_data['frangi_output'],
+        'junction_points': skeleton_data['junction_points'],
+        'endpoints': skeleton_data['endpoints'],
     }
 
-    return skeleton_final, fibers, img_original, dist_transform, intermediate_images
+    return skeleton_data['skeleton_final'], fibers, img_original, skeleton_data['dist_transform'], intermediate_images
 
 
 # --- PDF GENERATION LOGIC ---
@@ -382,11 +724,49 @@ dist_transform_max = st.sidebar.slider(
     help="Maximum distance transform value for skeleton cleaning"
 )
 
+# Intensity-based method parameters
+st.sidebar.subheader("Intensity-Based Methods")
+intensity_weight = st.sidebar.slider(
+    "Intensity Weight (Method 2)",
+    min_value=0.0, max_value=1.0, value=0.5, step=0.1,
+    help="Weight for intensity vs angle in junction decisions (0=angle only, 1=intensity only)"
+)
+intensity_threshold = st.sidebar.slider(
+    "Merge Intensity Threshold (Method 3)",
+    min_value=5, max_value=100, value=25,
+    help="Max intensity difference for merging fibers"
+)
+merge_angle_threshold = st.sidebar.slider(
+    "Merge Angle Threshold (Method 3)",
+    min_value=15, max_value=90, value=45,
+    help="Max angle deviation (degrees) for merging fibers"
+)
+max_intensity_deviation = st.sidebar.slider(
+    "Max Intensity Deviation (Method 4)",
+    min_value=10, max_value=100, value=30,
+    help="Maximum allowed intensity deviation from running average"
+)
+
+# Method selection for main analysis
+st.sidebar.subheader("🎯 Analysis Method")
+selected_method = st.sidebar.selectbox(
+    "Method for Report",
+    options=['angle_only', 'intensity_weighted', 'post_merge', 'intensity_corridor'],
+    format_func=lambda x: {
+        'angle_only': '1: Angle Only (Original)',
+        'intensity_weighted': '2: Intensity-Weighted Junctions',
+        'post_merge': '3: Post-Processing Merge',
+        'intensity_corridor': '4: Intensity Corridor',
+    }[x],
+    help="Select which method to use for the main analysis and PDF report"
+)
+
 # Visualization options
 st.sidebar.subheader("📊 Display Options")
 show_noise_filter_view = st.sidebar.checkbox("Show Noise Filtering Impact", value=True)
 show_junction_overlay = st.sidebar.checkbox("Show Junction Points", value=True)
 show_frangi_output = st.sidebar.checkbox("Show Frangi Filter Output", value=False)
+show_method_comparison = st.sidebar.checkbox("Show Method Comparison", value=True)
 
 uploaded_file = st.file_uploader("Upload fiber image", type=["jpg", "jpeg", "png"])
 
@@ -400,10 +780,18 @@ if uploaded_file is not None:
             'min_object_area': min_object_area,
             'blob_threshold': blob_threshold,
             'dist_transform_max': dist_transform_max,
+            'intensity_weight': intensity_weight,
+            'intensity_threshold': intensity_threshold,
+            'merge_angle_threshold': merge_angle_threshold,
+            'max_intensity_deviation': max_intensity_deviation,
         }
 
+        # Read the file once
+        file_bytes = uploaded_file.read()
+
+        # Process with selected method for main analysis
         skeleton_final, fibers, img_original, dist_transform, intermediate_images = process_fiber_image(
-            uploaded_file.read(), processing_params
+            file_bytes, processing_params, method=selected_method
         )
 
         # --- OPTIONAL: Frangi Filter Output View ---
@@ -411,6 +799,119 @@ if uploaded_file is not None:
             st.subheader("🔍 Frangi Filter Output")
             frangi_colored = cv2.applyColorMap(intermediate_images['frangi_output'], cv2.COLORMAP_JET)
             st.image(frangi_colored, use_container_width=True, caption="Frangi filter response (fiber enhancement)")
+
+        # --- METHOD COMPARISON VIEW ---
+        if show_method_comparison:
+            st.subheader("🔬 Intensity Method Comparison")
+            st.caption("Compare all 4 methods to see which produces the best fiber coherence for your images")
+
+            # Process with all methods
+            methods = {
+                'angle_only': 'Method 1: Angle Only (Original)',
+                'intensity_weighted': 'Method 2: Intensity-Weighted Junctions',
+                'post_merge': 'Method 3: Post-Processing Merge',
+                'intensity_corridor': 'Method 4: Intensity Corridor',
+            }
+
+            method_fibers = {}
+            method_stats = {}
+
+            for method_key in methods.keys():
+                _, method_fiber_list, _, _, _ = process_fiber_image(
+                    file_bytes, processing_params, method=method_key
+                )
+                method_fibers[method_key] = method_fiber_list
+
+                # Count valid fibers (applying length filters)
+                valid_count = 0
+                total_length = 0
+                for path in method_fiber_list:
+                    length_px = sum(
+                        math.hypot(p2[1] - p1[1], p2[0] - p1[0])
+                        for p1, p2 in zip(path[:-1], path[1:])
+                    )
+                    if min_length <= length_px <= max_length:
+                        valid_count += 1
+                        total_length += length_px
+
+                method_stats[method_key] = {
+                    'count': valid_count,
+                    'avg_length': total_length / valid_count if valid_count > 0 else 0
+                }
+
+            # Create comparison visualizations
+            # Use distinct colors for each fiber
+            def create_method_visualization(method_key, img_base):
+                vis = cv2.cvtColor(img_base.copy(), cv2.COLOR_GRAY2BGR)
+                fiber_list = method_fibers[method_key]
+
+                # Generate distinct colors for fibers
+                np.random.seed(42)  # Consistent colors across methods
+                colors = []
+                for i in range(len(fiber_list)):
+                    hue = (i * 137) % 360  # Golden angle for good distribution
+                    # Convert HSV to BGR
+                    h = hue / 2  # OpenCV uses 0-180 for hue
+                    color_hsv = np.uint8([[[h, 255, 255]]])
+                    color_bgr = cv2.cvtColor(color_hsv, cv2.COLOR_HSV2BGR)[0][0]
+                    colors.append(tuple(map(int, color_bgr)))
+
+                fiber_idx = 0
+                for path in fiber_list:
+                    length_px = sum(
+                        math.hypot(p2[1] - p1[1], p2[0] - p1[0])
+                        for p1, p2 in zip(path[:-1], path[1:])
+                    )
+                    if length_px < min_length or length_px > max_length:
+                        continue
+
+                    color = colors[fiber_idx % len(colors)] if colors else (255, 0, 255)
+                    for y, x in path:
+                        cv2.circle(vis, (x, y), 1, color, -1)
+                    fiber_idx += 1
+
+                return vis
+
+            # Display in 2x2 grid
+            col1, col2 = st.columns(2)
+
+            with col1:
+                vis1 = create_method_visualization('angle_only', img_original)
+                st.image(vis1, use_container_width=True,
+                         caption=f"Method 1: Angle Only - {method_stats['angle_only']['count']} fibers, avg {method_stats['angle_only']['avg_length']:.1f}px")
+
+                vis3 = create_method_visualization('post_merge', img_original)
+                st.image(vis3, use_container_width=True,
+                         caption=f"Method 3: Post-Merge - {method_stats['post_merge']['count']} fibers, avg {method_stats['post_merge']['avg_length']:.1f}px")
+
+            with col2:
+                vis2 = create_method_visualization('intensity_weighted', img_original)
+                st.image(vis2, use_container_width=True,
+                         caption=f"Method 2: Intensity-Weighted - {method_stats['intensity_weighted']['count']} fibers, avg {method_stats['intensity_weighted']['avg_length']:.1f}px")
+
+                vis4 = create_method_visualization('intensity_corridor', img_original)
+                st.image(vis4, use_container_width=True,
+                         caption=f"Method 4: Intensity Corridor - {method_stats['intensity_corridor']['count']} fibers, avg {method_stats['intensity_corridor']['avg_length']:.1f}px")
+
+            # Summary table
+            st.markdown("### Method Comparison Summary")
+            comparison_df = pd.DataFrame({
+                'Method': [methods[k] for k in methods.keys()],
+                'Fiber Count': [method_stats[k]['count'] for k in methods.keys()],
+                'Avg Length (px)': [f"{method_stats[k]['avg_length']:.1f}" for k in methods.keys()],
+            })
+            st.dataframe(comparison_df, use_container_width=True, hide_index=True)
+
+            st.info("""
+            **Interpretation Guide:**
+            - **Fewer fibers with longer average length** = better merging of coherent fiber segments
+            - **Method 1 (Angle Only)**: Baseline - uses only geometric continuity
+            - **Method 2 (Intensity-Weighted)**: At junctions, prefers paths with similar brightness
+            - **Method 3 (Post-Merge)**: Merges segments after extraction if intensities match
+            - **Method 4 (Intensity Corridor)**: Tracks along consistent brightness paths
+
+            Each fiber is shown in a different color. Look for cases where the same physical fiber is split into multiple colors (bad) vs shown as one color (good).
+            """)
 
         # --- OPTIONAL: Noise Filtering Impact View ---
         if show_noise_filter_view:
