@@ -755,14 +755,87 @@ if uploaded_file is not None:
                 # Custom HTML with JavaScript for hover highlighting
                 html_content = f"""
                 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
-                <div id="fiber-plot" style="width:100%; height:500px;"></div>
+                <div id="fiber-plot" style="width:100%; height:500px; background-color:#fff;"></div>
                 <script>
                     var figData = {fig_json};
                     var plotDiv = document.getElementById('fiber-plot');
 
+                    // Custom fullscreen button for modebar
+                    var fullscreenButton = {{
+                        name: 'Toggle Fullscreen',
+                        icon: {{
+                            'width': 1792,
+                            'path': 'M1664 640v-416q0-40-28-68t-68-28h-416q-40 0-68 28t-28 68 28 68 68 28h269l-736 736-736-736h269q40 0 68-28t28-68-28-68-68-28h-416q-40 0-68 28t-28 68v416q0 40 28 68t68 28 68-28 28-68v-269l736 736 736-736v269q0 40 28 68t68 28 68-28 28-68z',
+                            'ascent': 1792,
+                            'descent': 0
+                        }},
+                        click: function(gd) {{
+                            var elem = gd;
+                            if (!document.fullscreenElement) {{
+                                if (elem.requestFullscreen) {{
+                                    elem.requestFullscreen();
+                                }} else if (elem.webkitRequestFullscreen) {{
+                                    elem.webkitRequestFullscreen();
+                                }} else if (elem.msRequestFullscreen) {{
+                                    elem.msRequestFullscreen();
+                                }}
+                            }} else {{
+                                if (document.exitFullscreen) {{
+                                    document.exitFullscreen();
+                                }} else if (document.webkitExitFullscreen) {{
+                                    document.webkitExitFullscreen();
+                                }} else if (document.msExitFullscreen) {{
+                                    document.msExitFullscreen();
+                                }}
+                            }}
+                        }}
+                    }};
+
                     Plotly.newPlot(plotDiv, figData.data, figData.layout, {{
                         displayModeBar: true,
-                        modeBarButtonsToRemove: ['lasso2d', 'select2d']
+                        modeBarButtonsToRemove: ['lasso2d', 'select2d'],
+                        modeBarButtonsToAdd: [fullscreenButton],
+                        responsive: true
+                    }});
+
+                    // Handle fullscreen changes to resize plot
+                    document.addEventListener('fullscreenchange', function() {{
+                        if (document.fullscreenElement) {{
+                            // Entering fullscreen - resize to full viewport
+                            plotDiv.style.height = '100vh';
+                            plotDiv.style.width = '100vw';
+                            Plotly.relayout(plotDiv, {{
+                                height: window.innerHeight,
+                                width: window.innerWidth
+                            }});
+                        }} else {{
+                            // Exiting fullscreen - restore original size
+                            plotDiv.style.height = '500px';
+                            plotDiv.style.width = '100%';
+                            Plotly.relayout(plotDiv, {{
+                                height: 500,
+                                width: null
+                            }});
+                        }}
+                    }});
+
+                    // Webkit browsers (Safari, older Chrome)
+                    document.addEventListener('webkitfullscreenchange', function() {{
+                        if (document.webkitFullscreenElement) {{
+                            plotDiv.style.height = '100vh';
+                            plotDiv.style.width = '100vw';
+                            Plotly.relayout(plotDiv, {{
+                                height: window.innerHeight,
+                                width: window.innerWidth
+                            }});
+                        }} else {{
+                            plotDiv.style.height = '500px';
+                            plotDiv.style.width = '100%';
+                            Plotly.relayout(plotDiv, {{
+                                height: 500,
+                                width: null
+                            }});
+                        }}
                     }});
 
                     // Track last hovered trace to reset it
